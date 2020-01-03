@@ -1,3 +1,7 @@
+process.on('SIGINT', () => processExit());
+process.on('SIGUSR1', () => processExit());
+process.on('SIGUSR2', () => processExit());
+
 const Promise = require("bluebird");
 const fs = require("fs");
 const request = require("request");
@@ -7,11 +11,23 @@ const ffmpeg = require('fluent-ffmpeg');
 const utils = require('./utils');
 
 let round = 0;
+let processAlife = true;
+
 const nameTmpDir = "tmp";
 const nameDistDir = "dist";
 
+const formatVideoAllowed = ['application/octet-stream', 'video/mp2t', 'video/MP2T'];
+
 const debug = options => (...args) =>
   options.debug && console.log(args.join(' '));
+
+const processExit = () => {
+  if (processAlife === false) {
+    process.exit(1);
+  }
+  processAlife = false;
+  debug({ debug: true })(`Please CTRL+C again to kill the process or wait until the merge is done`);
+};
 
 const gRandomName = () => {
   const randomName = uuidv4();
@@ -25,7 +41,7 @@ const requestFile = (urlmedia, videoList) => mediaName =>
     request
       .get(urlmedia)
       .on('response', res => {
-        if (res.headers['content-type'] !== 'video/MP2T') {
+        if (!formatVideoAllowed.includes(res.headers['content-type'])) {
           merror = `Bad content-type format ${res.headers['content-type']}`;
         }
       })
@@ -46,7 +62,7 @@ const requestFiles = (logicFiles, options) => videoList =>
   new Promise(async (resolve, reject) => {
     debug(options)("Process frames downloading");
     let nbrLoop = 1;
-    while (true) {
+    while (processAlife) {
       debug(options)("Download frame n°" + nbrLoop);
       const mediaName = gRandomName();
       const urlmedia = logicFiles(nbrLoop++);
@@ -58,6 +74,7 @@ const requestFiles = (logicFiles, options) => videoList =>
       }
       videoList.push(mediaName);
     }
+    resolve();
   });
 
 const processMerge = options => (sortedFiles, step) =>
@@ -102,12 +119,17 @@ module.exports = async (nameDistFile, logicFiles, opts) =>
 
   const videoList = [];
 
-  utils.rmp(__dirname + "/" + nameTmpDir);
+  // utils.rmp(__dirname + "/" + nameTmpDir);
   utils.mkdirp(__dirname + "/" + nameTmpDir);
   utils.mkdirp(__dirname + "/" + nameDistDir);
 
   await requestFiles(logicFiles, options)(videoList)
     .catch(e => debug(options)(e));
+
+  if (videoList.length === 0) {
+    debug(options)(`No video has been downloaded`);
+    process.exit(1);
+  }
 
   const finalyFileName = await sortFilesAndMerge(options)(videoList);
   debug(options)(`"sortFilesAndMerge" process are finished. Tmp file => ${finalyFileName}`);
