@@ -1,32 +1,39 @@
-process.on('SIGINT', () => processExit());
-process.on('SIGUSR1', () => processExit());
-process.on('SIGUSR2', () => processExit());
+process.on("SIGINT", () => processExit());
+process.on("SIGUSR1", () => processExit());
+process.on("SIGUSR2", () => processExit());
 
 const Promise = require("bluebird");
 const fs = require("fs");
 const request = require("request");
 const uuidv4 = require("uuid/v4");
-const ffmpeg = require('fluent-ffmpeg');
+const ffmpeg = require("fluent-ffmpeg");
 
-const utils = require('./utils');
+const utils = require("./utils");
 
 let round = 0;
 let processAlife = true;
 
 const nameTmpDir = "tmp";
 const nameDistDir = "dist";
+const nameCacheFile = ".cache.json";
 
-const formatVideoAllowed = ['application/octet-stream', 'video/mp2t', 'video/MP2T'];
+const formatVideoAllowed = [
+  "application/octet-stream",
+  "video/mp2t",
+  "video/MP2T",
+];
 
-const debug = options => (...args) =>
-  options.debug && console.log(args.join(' '));
+const debug = (...args) =>
+  process.env.DEBUG_ENABLED === "true" && console.log(args.join(" "));
 
 const processExit = () => {
   if (processAlife === false) {
     process.exit(1);
   }
   processAlife = false;
-  debug({ debug: true })(`Please CTRL+C again to kill the process or wait until the merge is done`);
+  console.error(
+    `Please CTRL+C again to kill the process or wait until the merge is done`
+  );
 };
 
 const gRandomName = () => {
@@ -35,39 +42,30 @@ const gRandomName = () => {
   return mediaName;
 };
 
-const requestFile = (urlmedia, videoList) => mediaName =>
+const requestFile = (urlmedia, mediaName) =>
   new Promise((resolve, reject) => {
     let merror = null;
     request
       .get(urlmedia)
-      .on('response', res => {
-        if (!formatVideoAllowed.includes(res.headers['content-type'])) {
-          merror = `Bad content-type format ${res.headers['content-type']}`;
+      .on("response", (res) => {
+        if (!formatVideoAllowed.includes(res.headers["content-type"])) {
+          merror = `Bad content-type format ${res.headers["content-type"]}`;
         }
       })
-      .pipe(
-        fs.createWriteStream(mediaName)
-      )
-      .on('finish', () =>
-        merror
-          ? reject(merror)
-          : resolve()
-      )
-      .on('error', error => 
-        reject(error)
-      )
+      .pipe(fs.createWriteStream(mediaName))
+      .on("finish", () => (merror ? reject(merror) : resolve()))
+      .on("error", (error) => reject(error));
   });
 
-const requestFiles = (logicFiles, options) => videoList =>
+const requestFiles = (videoList, fileLoopCb) =>
   new Promise(async (resolve, reject) => {
-    debug(options)("Process frames downloading");
+    debug("Process frames downloading");
     let nbrLoop = 1;
     while (processAlife) {
-      debug(options)("Download frame n°" + nbrLoop);
+      debug("Download frame n°" + nbrLoop);
       const mediaName = gRandomName();
-      const urlmedia = logicFiles(nbrLoop++);
-      const merror = await requestFile(urlmedia, videoList)(mediaName)
-        .catch(err => err);
+      const urlmedia = fileLoopCb(nbrLoop++);
+      const merror = await requestFile(urlmedia, mediaName).catch((err) => err);
       if (merror) {
         reject(merror);
         break;
@@ -77,65 +75,108 @@ const requestFiles = (logicFiles, options) => videoList =>
     resolve();
   });
 
-const processMerge = options => (sortedFiles, step) =>
+const processMerge = (inputList) =>
   new Promise((resolve, reject) => {
-    debug(options)("Process frames merging round n°", round, "step n°", step + 1);
     const mediaName = gRandomName();
-    const fvideo = ffmpeg();
-    sortedFiles.map(video =>
-      fvideo.mergeAdd(video)
-    );
-    fvideo
+    inputList
+      .reduce((fvideo, input) => fvideo.addInput(input), ffmpeg())
       // .videoBitrate(1000)
       // .audioBitrate(128)
-      .on('error', err => reject(err))
-      .on('end', () => {
-        sortedFiles.map(video => utils.rm(video));
+      .on("error", (err) => reject(err))
+      .on("end", () => {
+        // inputList.map((video) => utils.rm(video));
         resolve(mediaName);
       })
       .mergeToFile(mediaName);
   });
 
-const sortFilesAndMerge = options => async videoList => {
-  debug(options)("Sort frames merging round n°", (round++) + 1);
-  const sortedFiles = videoList.reduce((acc, video, index) => {
-    const plmerge = ~~(index / options.maxMergeFile);
+const sortFilesAndMerge = async (videoList, options) => {
+  // ---
+  debug("Sort frames merging round n°", round++ + 1);
+  const inputLists = videoList.reduce((acc, video, index) => {
+    const plmerge = ~~(index / options.maxMergeFile); // improve this part to cache it as well
     acc[plmerge] = acc[plmerge] || [];
     acc[plmerge].push(video);
     return acc;
   }, []);
-  const mergedFiles = await Promise.mapSeries(sortedFiles, processMerge(options));
+
+  // ---
+  const mergedFiles = await Promise.mapSeries(
+    inputLists,
+    (inputList, index) => {
+      debug(`Process frames merging round n°${round} step n°${index + 1}`);
+      return processMerge(inputList);
+    }
+  );
+
+  // ---
   return mergedFiles.length === 1
     ? mergedFiles.shift()
-    : sortFilesAndMerge(options)(mergedFiles);
+    : sortFilesAndMerge(mergedFiles, options);
 };
 
-module.exports = async (nameDistFile, logicFiles, opts) =>
-{
-  const options = Object.assign({
-    debug: true,
-    maxMergeFile: 50
-  }, opts || {});
+const defaultOption = { debug: true, maxMergeFile: 50 };
+module.exports = async (nameDistFile, fileLoopCb, opts = defaultOption) => {
+  const options = { ...defaultOption, opts };
+  process.env.DEBUG_ENABLED = options.debug;
 
-  const videoList = [];
+  let videoList = [];
 
+  //
+  const cacheFilePath = __dirname + "/" + nameCacheFile;
+
+  // ---
+  // const tmpFilesPath = __dirname + "/" + nameTmpDir;
+  // for (const filename of fs.readdirSync(__dirname + "/" + nameTmpDir)) {
+  //   if (![".", ".."].includes(filename)) {
+  //     videoList.push({
+  //       filePath: tmpFilesPath + "/" + filename,
+  //       ...fs.statSync(tmpFilesPath + "/" + filename),
+  //     });
+  //   }
+  // }
+  // videoList = videoList
+  //   .sort((a, b) => a.birthtimeMs - b.birthtimeMs)
+  //   .map((info) => info.filePath);
+  // utils.touch(cacheFilePath, JSON.stringify(videoList));
+  // return;
+  // ---
+
+  // ---
   // utils.rmp(__dirname + "/" + nameTmpDir);
   utils.mkdirp(__dirname + "/" + nameTmpDir);
   utils.mkdirp(__dirname + "/" + nameDistDir);
 
-  await requestFiles(logicFiles, options)(videoList)
-    .catch(e => debug(options)(e));
+  // ---
+  if (!fs.existsSync(cacheFilePath)) {
+    await requestFiles(videoList, fileLoopCb).catch(debug);
 
-  if (videoList.length === 0) {
-    debug(options)(`No video has been downloaded`);
-    process.exit(1);
+    if (videoList.length === 0) {
+      debug(`No video has been downloaded`);
+      process.exit(1);
+    }
+  } else {
+    const content = fs.readFileSync(cacheFilePath, "utf8");
+    videoList = JSON.parse(content);
   }
 
-  const finalyFileName = await sortFilesAndMerge(options)(videoList);
-  debug(options)(`"sortFilesAndMerge" process are finished. Tmp file => ${finalyFileName}`);
+  // Save in cache
+  utils.touch(cacheFilePath, JSON.stringify(videoList));
 
-  fs.copyFileSync(finalyFileName, __dirname + "/" + nameDistDir + "/" + nameDistFile);
-  debug(options)(`The file "${nameDistFile}" is now available.`);
+  // ---
+  const finalFileName = await sortFilesAndMerge(videoList, options);
+  debug(
+    `"sortFilesAndMerge" process are finished. Tmp file => ${finalFileName}`
+  );
 
-  utils.rm(finalyFileName);
+  // ---
+  fs.copyFileSync(
+    finalFileName,
+    __dirname + "/" + nameDistDir + "/" + nameDistFile
+  );
+  debug(`The file "${nameDistFile}" is now available.`);
+
+  // ---
+  utils.rm(finalFileName);
+  utils.rm(cacheFilePath);
 };
