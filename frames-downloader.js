@@ -84,7 +84,7 @@ const processMerge = (inputList) =>
       // .audioBitrate(128)
       .on("error", (err) => reject(err))
       .on("end", () => {
-        // inputList.map((video) => utils.rm(video));
+        inputList.map((video) => utils.rm(video));
         resolve(mediaName);
       })
       .mergeToFile(mediaName);
